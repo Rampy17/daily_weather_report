@@ -1,6 +1,6 @@
-# Daily Weather Report
+# 🌤️ Daily Weather Report Webhook
 
-A Python application for fetching, processing, and reporting daily weather information.
+Production-ready Flask webhook for Houston weather forecasts. Deploy to Railway in 2 minutes!
 
 ## Project Structure
 
