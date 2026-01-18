@@ -1,4 +1,29 @@
-# Modal Webhook Deployment - DEPLOYED ✓
+# Houston Weather Webhook - Modal Deployment Guide
+
+## ✅ Your Webhook is Already Deployed!
+
+Your Houston Weather webhook is **already live and publicly accessible** via Railway:
+
+### 🟢 **LIVE PRODUCTION URL**
+```
+https://web-production-bf771.up.railway.app/weather
+```
+
+### Quick Test
+```bash
+# Get Houston weather
+curl "https://web-production-bf771.up.railway.app/weather"
+
+# Health check  
+curl "https://web-production-bf771.up.railway.app/health"
+
+# Pretty print with jq
+curl "https://web-production-bf771.up.railway.app/weather" | jq .
+```
+
+---
+
+## Why Railway vs Modal - DEPLOYED ✓
 
 ## 🎉 Deployment Status: LIVE
 
