@@ -1,159 +1,155 @@
 """Weather data fetching module using Open-Meteo API."""
 
 import json
+import logging
 import requests
 import time
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Dict, Any
 
+logger = logging.getLogger(__name__)
+
 
 class WeatherFetcher:
-    """Fetches weather data from Open-Meteo API."""
+    """Fetches weather data from Open-Meteo API with resilience and error handling."""
     
     BASE_URL = "https://api.open-meteo.com/v1"
     GEOCODING_URL = "https://geocoding-api.open-meteo.com/v1"
     
-    # Retry configuration
     MAX_RETRIES = 3
-    INITIAL_RETRY_DELAY = 1  # seconds
-    MAX_RETRY_DELAY = 8  # seconds
-    TIMEOUT = 10  # seconds
+    INITIAL_RETRY_DELAY = 1
+    MAX_RETRY_DELAY = 8
+    TIMEOUT = 10
     
-    def __init__(self, data_dir: str = "data"):
-        """Initialize the weather fetcher.
-        
-        Args:
-            data_dir: Directory to save weather data files.
-        """
+    def __init__(self, data_dir: str = "data") -> None:
+        """Initialize the weather fetcher."""
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(exist_ok=True)
+        logger.debug(f"WeatherFetcher initialized with data_dir={data_dir}")
     
-    def _make_request_with_retry(self, url: str, params: Dict) -> Optional[Dict[str, Any]]:
+    def _calculate_backoff(self, attempt: int) -> int:
+        """Calculate exponential backoff delay."""
+        delay = self.INITIAL_RETRY_DELAY * (2 ** attempt)
+        return min(delay, self.MAX_RETRY_DELAY)
+    
+    def _handle_retry(self, attempt: int, error_msg: str) -> bool:
+        """Log retry attempt and sleep if not final attempt."""
+        if attempt < self.MAX_RETRIES - 1:
+            delay = self._calculate_backoff(attempt)
+            logger.warning(f"{error_msg} Retrying in {delay}s...")
+            time.sleep(delay)
+            return True
+        logger.error(f"{error_msg} Max retries exceeded")
+        return False
+    
+    def _make_request_with_retry(self, url: str, params: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Make HTTP request with exponential backoff retry logic.
         
-        Args:
-            url: API endpoint URL
-            params: Query parameters
-            
-        Returns:
-            JSON response data or None on failure
+        Differentiates between retryable (5xx, network) and non-retryable (4xx) errors.
         """
-        retry_delay = self.INITIAL_RETRY_DELAY
-        
         for attempt in range(self.MAX_RETRIES):
             try:
                 response = requests.get(url, params=params, timeout=self.TIMEOUT)
                 response.raise_for_status()
+                logger.debug(f"Request succeeded on attempt {attempt + 1}")
                 return response.json()
+                
+            except requests.HTTPError as e:
+                if 400 <= e.response.status_code < 500:
+                    logger.error(f"Client error {e.response.status_code}: {str(e)}")
+                    return None
+                elif 500 <= e.response.status_code < 600:
+                    if not self._handle_retry(attempt, f"Server error {e.response.status_code}:"):
+                        return None
+                        
             except requests.Timeout:
-                print(f"Timeout on attempt {attempt + 1}/{self.MAX_RETRIES}")
-                if attempt < self.MAX_RETRIES - 1:
-                    print(f"Retrying in {retry_delay} seconds...")
-                    time.sleep(retry_delay)
-                    retry_delay = min(retry_delay * 2, self.MAX_RETRY_DELAY)
-                continue
-            except (requests.ConnectionError, requests.RequestException) as e:
-                print(f"Request error (attempt {attempt + 1}/{self.MAX_RETRIES}): {e}")
-                if attempt < self.MAX_RETRIES - 1:
-                    print(f"Retrying in {retry_delay} seconds...")
-                    time.sleep(retry_delay)
-                    retry_delay = min(retry_delay * 2, self.MAX_RETRY_DELAY)
-                continue
-            except json.JSONDecodeError as e:
-                print(f"Invalid JSON response: {e}")
-                if attempt < self.MAX_RETRIES - 1:
-                    print(f"Retrying in {retry_delay} seconds...")
-                    time.sleep(retry_delay)
-                    retry_delay = min(retry_delay * 2, self.MAX_RETRY_DELAY)
-                continue
+                if not self._handle_retry(attempt, f"Request timeout ({self.TIMEOUT}s):"):
+                    return None
+                    
+            except requests.ConnectionError:
+                if not self._handle_retry(attempt, "Connection error:"):
+                    return None
+                    
+            except json.JSONDecodeError:
+                if not self._handle_retry(attempt, "Invalid JSON response:"):
+                    return None
+                    
+            except requests.RequestException as e:
+                if not self._handle_retry(attempt, f"Request failed: {str(e)}"):
+                    return None
         
+        logger.error(f"All {self.MAX_RETRIES} retry attempts exhausted")
         return None
     
     def get_coordinates(self, city: str) -> Optional[Dict[str, Any]]:
-        """Get latitude and longitude for a city.
-        
-        Args:
-            city: City name to search for.
-            
-        Returns:
-            Dictionary with latitude, longitude, and city info, or None if not found.
-        """
-        try:
-            params = {
-                "name": city,
-                "count": 1,
-                "language": "en",
-                "format": "json"
-            }
-            
-            data = self._make_request_with_retry(f"{self.GEOCODING_URL}/search", params)
-            
-            if not data:
-                print("Failed to fetch coordinates after all retries")
-                return None
-            
-            results = data.get("results")
-            if not results or len(results) == 0:
-                # Try with just the first part (before comma)
-                if "," in city:
-                    city_name = city.split(",")[0].strip()
-                    print(f"City not found, retrying with: {city_name}")
-                    params["name"] = city_name
-                    data = self._make_request_with_retry(f"{self.GEOCODING_URL}/search", params)
-                    
-                    if data and data.get("results") and len(data["results"]) > 0:
-                        return self._extract_location_data(data["results"][0])
-                
-                print(f"City '{city}' not found in any search attempt")
-                return None
-            
-            return self._extract_location_data(results[0])
-        
-        except Exception as e:
-            print(f"Unexpected error in get_coordinates: {e}")
+        """Get latitude and longitude for a city."""
+        if not city or not isinstance(city, str) or len(city) > 100:
+            logger.error(f"Invalid city name: {repr(city)}")
             return None
+        
+        city = city.strip()
+        if not city:
+            logger.error("City name cannot be empty")
+            return None
+        
+        params = {"name": city, "count": 1, "language": "en", "format": "json"}
+        data = self._make_request_with_retry(f"{self.GEOCODING_URL}/search", params)
+        
+        if not data or "results" not in data or not data["results"]:
+            if "," in city:
+                city_only = city.split(",")[0].strip()
+                logger.info(f"Geocoding retry with city-only: {city_only}")
+                params["name"] = city_only
+                data = self._make_request_with_retry(f"{self.GEOCODING_URL}/search", params)
+            
+            if not data or "results" not in data or not data["results"]:
+                logger.error(f"Geocoding failed for city: {city}")
+                return None
+        
+        result = data["results"][0]
+        coords = {
+            "city": result.get("name", "Unknown"),
+            "state": result.get("admin1", ""),
+            "latitude": result.get("latitude"),
+            "longitude": result.get("longitude")
+        }
+        logger.debug(f"Geocoding result: {coords}")
+        return coords
     
-    def _extract_location_data(self, result: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """Safely extract location data from API result with validation.
-        
-        Args:
-            result: Raw result from API
-            
-        Returns:
-            Validated location dictionary or None if required fields missing
-        """
+    def _validate_forecast_data(self, forecast_data: Dict[str, Any]) -> bool:
+        """Validate forecast data has required structure and consistency."""
         try:
-            # Validate required fields
-            required_fields = ["latitude", "longitude"]
-            if not all(field in result for field in required_fields):
-                print(f"Warning: Missing required fields in API response")
-                return None
+            required_daily_keys = ["time", "temperature_2m_max", "temperature_2m_min", 
+                                  "precipitation_sum", "wind_speed_10m_max"]
             
-            return {
-                "latitude": result["latitude"],
-                "longitude": result["longitude"],
-                "city": result.get("name", "Unknown"),
-                "country": result.get("country", "Unknown"),
-                "state": result.get("admin1", "")
-            }
+            if "daily" not in forecast_data:
+                logger.error("Forecast data missing 'daily' key")
+                return False
+            
+            daily = forecast_data["daily"]
+            for key in required_daily_keys:
+                if key not in daily:
+                    logger.error(f"Forecast data missing daily key: {key}")
+                    return False
+            
+            # Check all daily arrays have same length
+            first_len = len(daily[required_daily_keys[0]])
+            if not all(len(daily[key]) == first_len for key in required_daily_keys[1:]):
+                logger.error("Forecast daily arrays have inconsistent lengths")
+                return False
+            
+            logger.debug(f"Forecast validation passed ({first_len} days)")
+            return True
         except (KeyError, TypeError) as e:
-            print(f"Error extracting location data: {e}")
-            return None
+            logger.error(f"Forecast validation error: {e}")
+            return False
     
     def fetch_forecast(self, city: str) -> Optional[Dict[str, Any]]:
-        """Fetch 7-day weather forecast for a city.
-        
-        Args:
-            city: City name to fetch forecast for.
-            
-        Returns:
-            Dictionary with forecast data, or None if fetch fails.
-        """
-        # Get coordinates for the city
+        """Fetch 7-day weather forecast for a city."""
         coords = self.get_coordinates(city)
         if not coords:
-            print(f"Cannot fetch forecast: coordinates for '{city}' not found.")
+            logger.error(f"Could not get coordinates for {city}")
             return None
         
         try:
@@ -169,70 +165,48 @@ class WeatherFetcher:
             
             forecast_data = self._make_request_with_retry(f"{self.BASE_URL}/forecast", params)
             
-            if not forecast_data:
-                print("Failed to fetch forecast after all retries")
+            if not forecast_data or not self._validate_forecast_data(forecast_data):
+                logger.error("Forecast data validation failed")
                 return None
             
-            # Validate forecast data
-            if not self._validate_forecast_data(forecast_data):
-                print("Forecast data validation failed")
-                return None
-            
-            # Combine location and forecast data
             result = {
                 "location": coords,
                 "forecast": forecast_data,
                 "fetched_at": datetime.now().isoformat()
             }
             
+            logger.info(f"Successfully fetched forecast for {coords['city']}, {coords['state']}")
             return result
         except Exception as e:
-            print(f"Unexpected error in fetch_forecast: {e}")
+            logger.error(f"Forecast fetch exception: {e}", exc_info=True)
             return None
-    
-    def _validate_forecast_data(self, data: Dict[str, Any]) -> bool:
-        """Validate forecast data has required structure.
-        
-        Args:
-            data: Forecast data from API
-            
-        Returns:
-            True if valid, False otherwise
-        """
-        try:
-            required_keys = ["daily"]
-            if not all(key in data for key in required_keys):
-                print("Missing required keys in forecast data")
-                return False
-            
-            daily = data["daily"]
-            required_daily_keys = ["time", "weather_code", "temperature_2m_max", "temperature_2m_min"]
-            if not all(key in daily for key in required_daily_keys):
-                print("Missing required daily forecast keys")
-                return False
-            
-            # Check that all arrays have same length
-            lengths = {key: len(daily[key]) for key in required_daily_keys}
-            if len(set(lengths.values())) > 1:
-                print("Forecast arrays have mismatched lengths")
-                return False
-            
-            return True
-        except (KeyError, TypeError) as e:
-            print(f"Error validating forecast data: {e}")
-            return False
     
     def save_forecast(self, forecast_data: Dict[str, Any], city: str) -> Optional[str]:
         """Save forecast data to JSON file.
         
         Args:
-            forecast_data: Weather forecast data to save.
-            city: City name (used for filename).
+            forecast_data: Forecast dictionary
+            city: City name for filename
             
         Returns:
-            Path to saved file, or None if save fails.
+            Path to saved file or None on error
         """
         if not forecast_data:
+            logger.warning("No forecast data to save")
+            return None
+        
+        try:
+            filename = f"{city.lower().replace(' ', '_').replace(',', '')}_forecast.json"
+            filepath = self.data_dir / filename
+            
+            with open(filepath, 'w') as f:
+                json.dump(forecast_data, f, indent=2)
+            
+            logger.info(f"Forecast saved to {filepath}")
+            return str(filepath)
+        except Exception as e:
+            logger.error(f"Failed to save forecast: {e}")
+            return None
             print("No forecast data to save.")
             return None
         
